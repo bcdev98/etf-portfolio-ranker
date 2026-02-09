@@ -45,13 +45,27 @@ Optional CSV export:
 python src/main.py --etfs SPY QQQ IWM XLE XLK VTI --csv examples/output.csv
 ```
 
+## Portfolio Optimizer (new)
+
+Add `--optimize` to optimize ETF weights over the top-ranked ETFs (long-only, sum to 1, max weight cap):
+
+```bash
+python src/main.py \
+  --etfs SPY QQQ IWM XLE XLK VTI \
+  --score-mode sharpe \
+  --best 5 \
+  --optimize \
+  --max-weight 0.50 \
+  --n-portfolios 5000
+```
+
 ## Streamlit App
 
 ```bash
 streamlit run src/app.py
 ```
 
-Then open the local URL and use the controls to tune period, score mode, risk-free rate, and sector penalty.
+The UI now supports both ranking and optimized ETF-weight recommendations.
 
 ## Notes
 
