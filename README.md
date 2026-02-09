@@ -2,14 +2,20 @@
 
 Given a list of ETFs, this project:
 
-1. Pulls each ETF's top holdings (components)
-2. Computes component annualized return and volatility (risk)
-3. Aggregates using holding weights
-4. Ranks ETFs by a combined score:
+1. Pulls top ETF holdings (components)
+2. Computes component annualized return + volatility (risk)
+3. Computes a Sharpe-like metric
+4. Adds a sector concentration penalty (HHI)
+5. Ranks ETFs and shows best N (default 5)
 
-`combined_score = weighted_return - weighted_volatility`
+## Scoring
 
-Then it shows the **best 5** (configurable).
+Two score modes:
+
+- `sharpe`: `(weighted_return - risk_free) / weighted_volatility - sector_penalty * sector_hhi`
+- `return_risk`: `(weighted_return - weighted_volatility) - sector_penalty * sector_hhi`
+
+Where sector HHI is the Herfindahl concentration of component sector weights (higher = less diversified).
 
 ## Setup
 
@@ -20,10 +26,17 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Run
+## CLI Usage
 
 ```bash
-python src/main.py --etfs SPY QQQ IWM XLE XLK VTI --period 1y --top-components 10 --best 5
+python src/main.py \
+  --etfs SPY QQQ IWM XLE XLK VTI \
+  --period 1y \
+  --top-components 10 \
+  --best 5 \
+  --score-mode sharpe \
+  --risk-free 0.02 \
+  --sector-penalty 0.20
 ```
 
 Optional CSV export:
@@ -32,8 +45,16 @@ Optional CSV export:
 python src/main.py --etfs SPY QQQ IWM XLE XLK VTI --csv examples/output.csv
 ```
 
+## Streamlit App
+
+```bash
+streamlit run src/app.py
+```
+
+Then open the local URL and use the controls to tune period, score mode, risk-free rate, and sector penalty.
+
 ## Notes
 
 - Data source: Yahoo Finance via `yfinance`
-- Some ETFs may not expose holdings reliably; those are skipped.
-- This is research tooling, **not investment advice**.
+- Some ETFs/components may be skipped if source data is unavailable.
+- For research/education only — not investment advice.

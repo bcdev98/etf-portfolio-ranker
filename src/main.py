@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -17,6 +17,7 @@ class ComponentMetric:
     weight: float
     annual_return: float
     annual_volatility: float
+    sector: str
 
 
 @dataclass
@@ -25,21 +26,18 @@ class EtfScore:
     component_count: int
     weighted_return: float
     weighted_volatility: float
+    sharpe_like: float
+    sector_hhi: float
     score: float
 
 
 def _get_etf_holdings(etf: str, top_n: int) -> pd.DataFrame:
     ticker = yf.Ticker(etf)
-
-    holdings = None
-    if hasattr(ticker, "funds_data") and ticker.funds_data is not None:
-        holdings = getattr(ticker.funds_data, "top_holdings", None)
-
+    holdings = getattr(getattr(ticker, "funds_data", None), "top_holdings", None)
     if holdings is None or len(holdings) == 0:
         raise ValueError(f"No holdings found for ETF {etf}.")
 
     df = holdings.copy()
-
     if "Symbol" in df.columns:
         symbol_series = df["Symbol"]
     elif "symbol" in df.columns:
@@ -58,7 +56,6 @@ def _get_etf_holdings(etf: str, top_n: int) -> pd.DataFrame:
     elif "weight" in df.columns:
         weight_col = "weight"
     else:
-        # fallback: equal weights if unavailable
         df["__weight"] = 1.0
         weight_col = "__weight"
 
@@ -68,46 +65,55 @@ def _get_etf_holdings(etf: str, top_n: int) -> pd.DataFrame:
             "weight": pd.to_numeric(df[weight_col], errors="coerce").fillna(0.0),
         }
     )
-    out = out[(out["symbol"] != "") & (out["symbol"] != "NAN")]
-    out = out.drop_duplicates(subset=["symbol"])
-
-    if out["weight"].sum() <= 0:
-        out["weight"] = 1.0 / max(len(out), 1)
-    else:
-        out["weight"] = out["weight"] / out["weight"].sum()
-
+    out = out[(out["symbol"] != "") & (out["symbol"] != "NAN")].drop_duplicates(subset=["symbol"])
+    out["weight"] = out["weight"] / out["weight"].sum() if out["weight"].sum() > 0 else 1.0 / max(len(out), 1)
     return out.head(top_n)
+
+
+def _get_sector(symbol: str) -> str:
+    try:
+        info = yf.Ticker(symbol).info
+        return str(info.get("sector") or "Unknown")
+    except Exception:
+        return "Unknown"
 
 
 def _compute_component_metrics(holdings: pd.DataFrame, period: str) -> List[ComponentMetric]:
     symbols = holdings["symbol"].tolist()
     prices = yf.download(symbols, period=period, interval="1d", auto_adjust=True, progress=False)["Close"]
-
     if isinstance(prices, pd.Series):
         prices = prices.to_frame(name=symbols[0])
 
     daily_returns = prices.pct_change().replace([np.inf, -np.inf], np.nan).dropna(how="all")
-
     metrics: List[ComponentMetric] = []
     for _, row in holdings.iterrows():
-        sym = row["symbol"]
-        wt = float(row["weight"])
-
+        sym, wt = row["symbol"], float(row["weight"])
         if sym not in daily_returns.columns:
             continue
-
         r = daily_returns[sym].dropna()
         if len(r) < 20:
             continue
-
-        ann_return = float(r.mean() * TRADING_DAYS)
-        ann_vol = float(r.std() * np.sqrt(TRADING_DAYS))
-        metrics.append(ComponentMetric(sym, wt, ann_return, ann_vol))
-
+        metrics.append(
+            ComponentMetric(
+                symbol=sym,
+                weight=wt,
+                annual_return=float(r.mean() * TRADING_DAYS),
+                annual_volatility=float(r.std() * np.sqrt(TRADING_DAYS)),
+                sector=_get_sector(sym),
+            )
+        )
     return metrics
 
 
-def score_etf(etf: str, period: str, top_n: int) -> Optional[EtfScore]:
+def _sector_hhi(metrics: List[ComponentMetric]) -> float:
+    by_sector: Dict[str, float] = {}
+    for m in metrics:
+        by_sector[m.sector] = by_sector.get(m.sector, 0.0) + m.weight
+    # Herfindahl index (0..1): higher = more concentrated sector exposure
+    return float(sum(w * w for w in by_sector.values()))
+
+
+def score_etf(etf: str, period: str, top_n: int, score_mode: str, risk_free: float, sector_penalty: float) -> Optional[EtfScore]:
     try:
         holdings = _get_etf_holdings(etf, top_n=top_n)
         metrics = _compute_component_metrics(holdings, period=period)
@@ -121,23 +127,31 @@ def score_etf(etf: str, period: str, top_n: int) -> Optional[EtfScore]:
 
         weighted_ret = float(np.dot(w, ret))
         weighted_vol = float(np.dot(w, vol))
-        score = weighted_ret - weighted_vol
+        sharpe_like = float((weighted_ret - risk_free) / max(weighted_vol, 1e-9))
+        hhi = _sector_hhi(metrics)
+
+        base = sharpe_like if score_mode == "sharpe" else (weighted_ret - weighted_vol)
+        score = float(base - sector_penalty * hhi)
 
         return EtfScore(
             etf=etf.upper(),
             component_count=len(metrics),
             weighted_return=weighted_ret,
             weighted_volatility=weighted_vol,
+            sharpe_like=sharpe_like,
+            sector_hhi=hhi,
             score=score,
         )
     except Exception:
         return None
 
 
-def rank_etfs(etfs: List[str], period: str, top_n: int, best_n: int) -> pd.DataFrame:
+def rank_etfs(
+    etfs: List[str], period: str, top_n: int, best_n: int, score_mode: str, risk_free: float, sector_penalty: float
+) -> pd.DataFrame:
     rows = []
     for etf in etfs:
-        s = score_etf(etf, period=period, top_n=top_n)
+        s = score_etf(etf, period, top_n, score_mode, risk_free, sector_penalty)
         if s is None:
             continue
         rows.append(
@@ -146,43 +160,53 @@ def rank_etfs(etfs: List[str], period: str, top_n: int, best_n: int) -> pd.DataF
                 "Components Used": s.component_count,
                 "Annual Return": s.weighted_return,
                 "Annual Volatility": s.weighted_volatility,
-                "Combined Score (Return-Vol)": s.score,
+                "Sharpe-like": s.sharpe_like,
+                "Sector HHI": s.sector_hhi,
+                "Score": s.score,
             }
         )
 
     if not rows:
         return pd.DataFrame()
-
-    df = pd.DataFrame(rows).sort_values("Combined Score (Return-Vol)", ascending=False)
-    return df.head(best_n).reset_index(drop=True)
+    return pd.DataFrame(rows).sort_values("Score", ascending=False).head(best_n).reset_index(drop=True)
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Rank ETFs by weighted component returns and risks, then show best N by combined score."
-    )
+    p = argparse.ArgumentParser(description="Rank ETFs by return/risk with optional Sharpe and sector diversification.")
     p.add_argument("--etfs", nargs="+", required=True, help="ETF tickers, e.g. SPY QQQ IWM XLE")
-    p.add_argument("--period", default="1y", help="Price history period for component stats (default: 1y)")
-    p.add_argument("--top-components", type=int, default=10, help="Top holdings per ETF to analyze (default: 10)")
-    p.add_argument("--best", type=int, default=5, help="How many ETFs to return (default: 5)")
-    p.add_argument("--csv", default="", help="Optional CSV output path")
+    p.add_argument("--period", default="1y")
+    p.add_argument("--top-components", type=int, default=10)
+    p.add_argument("--best", type=int, default=5)
+    p.add_argument("--score-mode", choices=["return_risk", "sharpe"], default="sharpe")
+    p.add_argument("--risk-free", type=float, default=0.02, help="Annual risk-free rate, decimal (default 0.02)")
+    p.add_argument("--sector-penalty", type=float, default=0.20, help="Penalty multiplier on sector concentration HHI")
+    p.add_argument("--csv", default="")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    df = rank_etfs(args.etfs, period=args.period, top_n=args.top_components, best_n=args.best)
-
+    df = rank_etfs(
+        args.etfs,
+        period=args.period,
+        top_n=args.top_components,
+        best_n=args.best,
+        score_mode=args.score_mode,
+        risk_free=args.risk_free,
+        sector_penalty=args.sector_penalty,
+    )
     if df.empty:
         print("No ETF scores produced. Check ETF symbols and data availability.")
         return
 
-    display_df = df.copy()
-    for c in ["Annual Return", "Annual Volatility", "Combined Score (Return-Vol)"]:
-        display_df[c] = (display_df[c] * 100).map(lambda x: f"{x:.2f}%")
+    out = df.copy()
+    for c in ["Annual Return", "Annual Volatility"]:
+        out[c] = (out[c] * 100).map(lambda x: f"{x:.2f}%")
+    out["Sector HHI"] = out["Sector HHI"].map(lambda x: f"{x:.3f}")
+    out["Sharpe-like"] = out["Sharpe-like"].map(lambda x: f"{x:.3f}")
+    out["Score"] = out["Score"].map(lambda x: f"{x:.3f}")
 
-    print(tabulate(display_df, headers="keys", tablefmt="github", showindex=False))
-
+    print(tabulate(out, headers="keys", tablefmt="github", showindex=False))
     if args.csv:
         df.to_csv(args.csv, index=False)
         print(f"\nSaved raw numeric results to: {args.csv}")
